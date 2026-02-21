@@ -158,6 +158,108 @@ cmd_doctor() {
       pass "ANCHOR_ORBIT_URL configured"
       if [[ -f "$CREDENTIALS_FILE" ]]; then
         pass "Credentials file exists ($CREDENTIALS_FILE)"
+
+        if command -v bun &>/dev/null; then
+          local auth_check_output=""
+          local auth_check_status=0
+          auth_check_output=$(ANCHOR_ORBIT_URL="$orbit_url" CREDENTIALS_FILE="$CREDENTIALS_FILE" bun -e '
+            const fs = require("fs");
+            const { createHmac } = require("node:crypto");
+
+            function b64url(input) {
+              const buf = Buffer.isBuffer(input) ? input : Buffer.from(input);
+              return buf.toString("base64").replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+            }
+
+            const orbitUrl = process.env.ANCHOR_ORBIT_URL;
+            const credPath = process.env.CREDENTIALS_FILE;
+            if (!orbitUrl || !credPath) {
+              console.log("fail: missing env");
+              process.exit(2);
+            }
+
+            let data;
+            try {
+              data = JSON.parse(fs.readFileSync(credPath, "utf8"));
+            } catch {
+              console.log("fail: read credentials");
+              process.exit(3);
+            }
+
+            const secret = data.anchorJwtSecret;
+            const userId = data.userId;
+            if (!secret || !userId) {
+              console.log("fail: missing credentials");
+              process.exit(4);
+            }
+
+            let url;
+            try {
+              url = new URL(orbitUrl);
+            } catch {
+              console.log("fail: invalid orbit url");
+              process.exit(5);
+            }
+
+            const now = Math.floor(Date.now() / 1000);
+            const header = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+            const payload = b64url(JSON.stringify({
+              iss: "zane-anchor",
+              aud: "zane-orbit-anchor",
+              sub: userId,
+              iat: now,
+              exp: now + 60
+            }));
+            const dataToSign = `${header}.${payload}`;
+            const sig = createHmac("sha256", secret).update(dataToSign).digest("base64");
+            const sigUrl = sig.replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+            const token = `${dataToSign}.${sigUrl}`;
+            url.searchParams.set("token", token);
+
+            const ws = new WebSocket(url.toString());
+            let opened = false;
+            const timer = setTimeout(() => {
+              if (!opened) {
+                console.log("fail: timeout");
+                process.exit(6);
+              }
+            }, 5000);
+
+            ws.addEventListener("open", () => {
+              opened = true;
+              clearTimeout(timer);
+              console.log("ok");
+              ws.close();
+              setTimeout(() => process.exit(0), 50);
+            });
+            ws.addEventListener("close", (ev) => {
+              if (!opened) {
+                clearTimeout(timer);
+                const code = ev && typeof ev.code === "number" ? ev.code : "unknown";
+                const reason = ev && ev.reason ? ev.reason : "";
+                console.log(`fail: closed ${code}${reason ? " " + reason : ""}`);
+                process.exit(7);
+              }
+            });
+            ws.addEventListener("error", () => {
+              if (!opened) {
+                clearTimeout(timer);
+                console.log("fail: error");
+                process.exit(8);
+              }
+            });
+          ' 2>&1) || auth_check_status=$?
+
+          if [[ $auth_check_status -eq 0 && "$auth_check_output" == "ok" ]]; then
+            pass "Orbit auth check passed"
+          else
+            warn "Orbit auth check failed (try 'zane login')"
+            if [[ -n "$auth_check_output" ]]; then
+              info "  $auth_check_output"
+            fi
+            has_error=1
+          fi
+        fi
       else
         warn "Not logged in. Run 'zane login' or 'zane start' to authenticate."
       fi
