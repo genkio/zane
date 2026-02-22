@@ -14,6 +14,31 @@ interface ReasoningState {
 
 type TurnCompleteCallback = (threadId: string, finalText: string) => void;
 
+interface RateLimitWindowState {
+  usedPercent: number;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+
+interface RateLimitState {
+  primary: RateLimitWindowState | null;
+  secondary: RateLimitWindowState | null;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function toFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return null;
+}
+
 class MessagesStore {
   #byThread = $state<Map<string, Message[]>>(new Map());
   #streamingText = $state<Map<string, string>>(new Map());
@@ -36,6 +61,7 @@ class MessagesStore {
   #planByThread = $state<Map<string, PlanStep[]>>(new Map());
   #planExplanationByThread = $state<Map<string, string | null>>(new Map());
   #statusDetailByThread = $state<Map<string, string | null>>(new Map());
+  #rateLimits = $state<RateLimitState>({ primary: null, secondary: null });
 
   get turnStatus() {
     const threadId = threads.currentId;
@@ -66,6 +92,22 @@ class MessagesStore {
     const threadId = threads.currentId;
     if (!threadId) return "";
     return this.#streamingReasoningTextByThread.get(threadId) ?? "";
+  }
+
+  get fiveHourUsagePercent() {
+    return this.#resolveRateLimitWindow(300)?.usedPercent ?? null;
+  }
+
+  get weeklyUsagePercent() {
+    return this.#resolveRateLimitWindow(7 * 24 * 60)?.usedPercent ?? null;
+  }
+
+  get fiveHourResetAt() {
+    return this.#resolveRateLimitWindow(300)?.resetsAt ?? null;
+  }
+
+  get weeklyResetAt() {
+    return this.#resolveRateLimitWindow(7 * 24 * 60)?.resetsAt ?? null;
   }
 
   interrupt(threadId: string): { success: boolean; error?: string } {
@@ -416,14 +458,91 @@ class MessagesStore {
     return trimmed;
   }
 
+  #resolveRateLimitWindow(durationMins: number): RateLimitWindowState | null {
+    const primary = this.#rateLimits.primary;
+    const secondary = this.#rateLimits.secondary;
+    const windows = [primary, secondary].filter((w): w is RateLimitWindowState => Boolean(w));
+
+    const exact = windows.find(
+      (window) => window.windowDurationMins != null && Math.abs(window.windowDurationMins - durationMins) <= 1,
+    );
+    if (exact) return exact;
+
+    if (durationMins === 300) {
+      return primary ?? windows[0] ?? null;
+    }
+    if (durationMins === 7 * 24 * 60) {
+      return secondary ?? windows[1] ?? null;
+    }
+    return windows[0] ?? null;
+  }
+
+  #extractRateLimitSnapshot(payload: unknown): Record<string, unknown> | null {
+    const root = asRecord(payload);
+    if (!root) return null;
+
+    const direct = asRecord(root.rateLimits) ?? asRecord(root.rate_limits);
+    if (direct) return direct;
+
+    const byLimitId = asRecord(root.rateLimitsByLimitId) ?? asRecord(root.rate_limits_by_limit_id);
+    if (byLimitId) {
+      const preferred = asRecord(byLimitId.codex);
+      if (preferred) return preferred;
+      for (const value of Object.values(byLimitId)) {
+        const candidate = asRecord(value);
+        if (candidate) return candidate;
+      }
+    }
+
+    if ("primary" in root || "secondary" in root) return root;
+    return null;
+  }
+
+  #normalizeRateLimitWindow(payload: unknown): RateLimitWindowState | null {
+    const window = asRecord(payload);
+    if (!window) return null;
+
+    const usedPercentRaw = toFiniteNumber(window.usedPercent ?? window.used_percent);
+    if (usedPercentRaw == null) return null;
+    const usedPercent = Math.max(0, Math.min(100, usedPercentRaw));
+
+    const windowDurationMins = toFiniteNumber(window.windowDurationMins ?? window.window_minutes);
+    const resetsRaw = toFiniteNumber(window.resetsAt ?? window.resets_at);
+    const resetsAt = resetsRaw == null ? null : (resetsRaw > 0 && resetsRaw < 1_000_000_000_000 ? resetsRaw * 1000 : resetsRaw);
+
+    return {
+      usedPercent,
+      windowDurationMins,
+      resetsAt,
+    };
+  }
+
+  #updateRateLimits(payload: unknown) {
+    const snapshot = this.#extractRateLimitSnapshot(payload);
+    if (!snapshot) return;
+
+    const primary = this.#normalizeRateLimitWindow(snapshot.primary);
+    const secondary = this.#normalizeRateLimitWindow(snapshot.secondary);
+    const nextPrimary = primary ?? this.#rateLimits.primary;
+    const nextSecondary = secondary ?? this.#rateLimits.secondary;
+    if (!nextPrimary && !nextSecondary) return;
+
+    this.#rateLimits = { primary: nextPrimary, secondary: nextSecondary };
+  }
+
   handleMessage(msg: RpcMessage) {
     if (msg.result && !msg.method) {
-      const result = msg.result as { thread?: { id: string; turns?: Array<{ items?: unknown[] }> } };
-      if (result.thread?.turns) {
-        const threadId = result.thread.id;
-        if (!this.#loadedThreads.has(threadId)) {
-          this.#loadedThreads.add(threadId);
-          this.#loadThread(threadId, result.thread.turns);
+      const result = asRecord(msg.result);
+      if (result) {
+        this.#updateRateLimits(result);
+        const thread = asRecord(result.thread);
+        if (thread) {
+          const threadId = (thread.id as string) || null;
+          const turns = thread.turns as Array<{ items?: unknown[] }> | undefined;
+          if (threadId && turns && !this.#loadedThreads.has(threadId)) {
+            this.#loadedThreads.add(threadId);
+            this.#loadThread(threadId, turns);
+          }
         }
       }
       return;
@@ -431,6 +550,23 @@ class MessagesStore {
 
     const method = msg.method;
     const params = msg.params as Record<string, unknown> | undefined;
+
+    if ((method === "sessionConfigured" || method === "session_configured") && params) {
+      this.#updateRateLimits(params.rateLimits ?? params.rate_limits ?? params);
+      const initialMessages = (params.initialMessages as unknown[]) || (params.initial_messages as unknown[]) || [];
+      for (const event of initialMessages) {
+        const eventRecord = asRecord(event);
+        if (!eventRecord) continue;
+        this.#updateRateLimits(eventRecord.rateLimits ?? eventRecord.rate_limits ?? eventRecord);
+      }
+      return;
+    }
+
+    if ((method === "account/rateLimits/updated" || method === "account/rate_limits/updated") && params) {
+      this.#updateRateLimits(params.rateLimits ?? params.rate_limits ?? params);
+      return;
+    }
+
     if (!params) return;
 
     const threadId = this.#extractThreadId(params);

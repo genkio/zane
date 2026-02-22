@@ -8,6 +8,8 @@
     modelOptions?: ModelOption[];
     modelsLoading?: boolean;
     disabled?: boolean;
+    fiveHourUsage?: string | null;
+    weeklyUsage?: string | null;
     onStop?: () => void;
     onSubmit: (input: string) => void;
     onModelChange: (model: string) => void;
@@ -22,6 +24,8 @@
     modelOptions = [],
     modelsLoading = false,
     disabled = false,
+    fiveHourUsage = null,
+    weeklyUsage = null,
     onStop,
     onSubmit,
     onModelChange,
@@ -250,6 +254,17 @@
         </button>
       {/if}
     </div>
+
+    <div class="status-strip stack">
+      <div class="status-row split">
+        <span class="status-key">5h usage</span>
+        <span class="status-data" class:missing={!fiveHourUsage}>{fiveHourUsage ?? "--"}</span>
+      </div>
+      <div class="status-row split">
+        <span class="status-key">Weekly usage</span>
+        <span class="status-data" class:missing={!weeklyUsage}>{weeklyUsage ?? "--"}</span>
+      </div>
+    </div>
   </div>
 </form>
 
@@ -302,6 +317,31 @@
     --split-gap: var(--space-sm);
     padding: var(--space-sm) var(--space-md);
     border-top: 1px solid var(--cli-border);
+  }
+
+  .status-strip {
+    --stack-gap: var(--space-xs);
+    padding: var(--space-xs) var(--space-md) var(--space-sm);
+    border-top: 1px solid var(--cli-border);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .status-row {
+    --split-gap: var(--space-sm);
+  }
+
+  .status-key {
+    color: var(--cli-text-muted);
+  }
+
+  .status-data {
+    color: var(--cli-text-dim);
+    text-align: right;
+  }
+
+  .status-data.missing {
+    color: var(--cli-text-muted);
   }
 
   .tools {
